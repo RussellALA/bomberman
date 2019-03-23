@@ -1,0 +1,2 @@
+model_checkpoint_path: "/home/russell/bomberman_ai/agent_code/nn_agent/weights.sav"
+all_model_checkpoint_paths: "/home/russell/bomberman_ai/agent_code/nn_agent/weights.sav"
