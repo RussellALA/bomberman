@@ -1,59 +1,59 @@
-
 import numpy as np
-from random import shuffle
-from time import time, sleep
-from collections import deque
 import tensorflow as tf
-import math
+from keras import backend as K
+from keras.models import Sequential
+from keras.initializers import he_uniform
+from keras.optimizers import RMSprop
+from keras.layers import Dense, Activation, LeakyReLU, Dropout
 
 from settings import s, e
 
 class Model():
 
-
     def __init__(self, logger, decay=0.95, beta = 0.01):
         """initialize the model with standard values"""
-        self.inputs = tf.placeholder(shape=[None, 289],dtype=tf.float32)
+        self.n_input = [1, 6]
+        self.n_hidden = [10,50,10]
+        self.n_classes = 6
 
-        self.weights1 = tf.Variable(tf.random_normal([289,289],stddev=0.05))
-        self.weights2 = tf.Variable(tf.random_normal([1024,1024],stddev=0.05))
-        self.weights3 = tf.Variable(tf.random_normal([1024,1024],stddev=0.05))
-        self.weights4 = tf.Variable(tf.random_normal([289,6],stddev=0.05))
+        self.inputs = tf.placeholder(shape=self.n_input, dtype=tf.float32)
 
-        self.bias1 = tf.Variable(tf.random_normal([1024], stddev=0.05))
-        self.bias2 = tf.Variable(tf.random_normal([1024], stddev=0.05))
-        self.bias3 = tf.Variable(tf.random_normal([1024], stddev=0.05))
-        self.bias4 = tf.Variable(tf.random_normal([6], stddev=0.05))
+        self.sess = tf.Session()
+        init = tf.global_variables_initializer()
+        self.sess.run(init)
+        K.set_session(self.sess)
 
+        self.model = Sequential()
+        self.model.add(Dense(self.n_hidden[0], input_dim=self.n_input[1], activation='sigmoid'))
+        self.model.add(LeakyReLU(alpha=0.3))
+        self.model.add(Dropout(0.3))
+        self.model.add(Dense(self.n_hidden[1], input_dim=self.n_hidden[0], use_bias=True, kernel_initializer= "he_uniform", bias_initializer= "zeros" ))
+        self.model.add(LeakyReLU(alpha=0.3))
+        self.model.add(Dropout(0.3))
+        self.model.add(Dense(self.n_hidden[2], input_dim=self.n_hidden[1], use_bias=True, kernel_initializer= "he_uniform", bias_initializer= "zeros" ))
+        self.model.add(LeakyReLU(alpha=0.3))
+        self.model.add(Dropout(0.3))
+        self.model.add(Dense(self.n_classes, input_dim=self.n_hidden[2], use_bias=True, kernel_initializer="he_uniform", bias_initializer="zeros"))
+        rms = RMSprop(lr=0.001, rho=0.9, epsilon=1e-08, decay=0.0)
+        self.model.compile(optimizer=rms, loss='mse')
 
-        hidden_out1 = tf.matmul(self.inputs,self.weights1)
-        #hidden_out2 = tf.matmul(hidden_out1, self.weights2)
-        #hidden_out3 = tf.matmul(hidden_out2, self.weights3)
-        self.Qout = tf.matmul(hidden_out1,self.weights4)
+        self.nextQ = tf.placeholder(shape=[None, self.n_classes], dtype=tf.float32)
+        self.Qout = self.model(self.inputs)
         self.prediction = tf.argmax(self.Qout, 1)
 
-        self.nextQ = tf.placeholder(shape=[None,6],dtype=tf.float32)
-
-        loss = tf.reduce_sum(tf.square(self.nextQ - self.Qout))
-        global_step = tf.Variable(0, trainable=False)
-        learning_rate = tf.train.exponential_decay(0.02, global_step,
-                                           100000, 0.95)
-        trainer = tf.train.AdamOptimizer(learning_rate)
-        self.updateModel = trainer.minimize(loss, global_step=global_step)
-        init = tf.initialize_all_variables()
-        self.sess = tf.Session()
-        self.sess.run(init)
+        self.nextQ = tf.placeholder(shape=[None, self.n_classes], dtype=tf.float32)
+        self.logger = logger
+        self.load_model('weights.h5')
         self.decay = decay
         self.saver = tf.train.Saver()
-        self.logger = logger
-        logger.debug("initialized session")
+        logger.debug("Initialize session")
         return
 
     def fit(self, batches):
         """fit the current estimator based on the expected and
         real rewards of recorded training events"""
         for data in batches:
-            newQ = self.sess.run(self.Qout,feed_dict={self.inputs:np.asarray(data['new_states']).reshape(1, 289)})
+            newQ = self.sess.run(self.Qout, feed_dict={self.inputs: np.asarray(data['new_states']).reshape(self.n_input[0], self.n_input[1])})
             maxQ = np.amax(newQ, axis=1)
             targetQ = np.asarray(data['oldQ'])
             rewards = np.asarray(data['rewards'])
@@ -61,57 +61,68 @@ class Model():
             decaying_rewards = 0
             for i in range(n_step):
                 decaying_rewards += rewards[i] * (self.decay ** i)
-            targetQ[np.arange(targetQ.shape[0]), np.asarray(data['actions'])] = decaying_rewards + (self.decay**n_step)*maxQ
-            self.sess.run([self.updateModel],
-                            feed_dict={self.inputs:np.asarray(data['old_states']).reshape(1, 289),
-                            self.nextQ:targetQ})
+            targetQ[np.arange(targetQ.shape[0]), np.asarray(data['actions'])] = decaying_rewards + (
+                        self.decay ** n_step) * np.clip(maxQ, -10000, 10000)
+
+            self.model.fit(np.asarray(data['old_states']).reshape(self.n_input[0], self.n_input[1]), targetQ)
         return
 
-    def estimate(self, state):
+    def estimate(self, state, keep = 0.5):
         """estimate the gain of an action, based on the current world state"""
         return self.sess.run([self.prediction, self.Qout], feed_dict = {self.inputs: np.expand_dims(state.flatten(), axis=0)})
 
-    def load_model(self, path = None):
+    def load_model(self, path):
         """setup the weigths and the like of the model"""
 
         if path:
-            self.logger.debug(f'Loading weigths from: {path}')
+            self.logger.debug(f'Loading weigths')
             try:
-                self.saver.restore(self.sess, path)
+                self.model.load_weights(path)
             except Exception as e:
-                self.logger.debug(f'Couldn\'t load weights from {path}. Error message: {e}')
-            #load the weigths from the path here
+                self.logger.debug(f'Couldn\'t load weights. Error message: {e}')
         else:
             self.logger.debug('Initializing with random weights')
-            #else, initialize randomly
         return
 
     def save_model(self, path = None):
         if path:
             self.logger.debug(f'Writing weights to: {path}')
             try:
-                self.saver.save(self.sess, path)
+                self.model.save_weights(path)
             except Exception as e:
                 self.logger.debug(f'Couldn\'t save weights to {path}. Error message: {e}')
-            #save weights to file
         else:
             self.logger.debug('Not saving weights')
         return
 
 def create_state(self):
-    x, y, _, bombs_left = self.game_state['self']
-    arena = self.game_state['arena']
     coins = self.game_state['coins']
-    pos = np.zeros(arena.shape)
-    pos[x,y] = 1
-    coin_pos = np.zeros(arena.shape)
-    coin_pos[np.asarray(coins)] = 1
-    self.state = pos - coin_pos
+    x,y,_,_ = self.game_state['self']
+    arena = self.game_state['arena']
+    explosions = self.game_state['explosions']
+    if not len(coins):
+        coins = [[x,y]]
+
+    self.state = np.zeros(4)
+
+    if arena[x + 1, y] != 0: self.state[0] = 1
+    if arena[x - 1, y] != 0: self.state[1] = 1
+    if arena[x, y + 1] != 0: self.state[2] = 1
+    if arena[x, y - 1] != 0: self.state[3] = 1
+    if explosions[x + 1, y] > 0: self.state[0] = 2
+    if explosions[x - 1, y] > 0: self.state[1] = 2
+    if explosions[x, y + 1] > 0: self.state[2] = 2
+    if explosions[x, y - 1] > 0: self.state[3] = 2
+
+    nearest_coin = np.argmin(np.sum(np.abs(np.asarray([x, y]) - np.asarray(coins)), axis=1))
+    coindist = np.clip(np.asarray(coins[nearest_coin]) - np.asarray([x, y]), -2, 2)
+    self.state = np.append(self.state, coindist)
     return
 
-def choose_rand_action(self, prob, count):
+def choose_rand_action(self, count):
+    self.epsilon = self.epsilon*0.995
     actions = ['LEFT', 'RIGHT', 'UP', 'DOWN', 'WAIT', 'BOMB']
-    if np.random.rand(1) < prob:
+    if np.random.rand(1) < self.epsilon:
         self.rand_count = count
     if self.rand_count > 0 or self.rand_round > 0:
         self.rand_count -= 1
@@ -125,28 +136,31 @@ def calculate_reward(self):
     old_dist = self.coindist
     events = self.events
     self.coindist = np.min(np.sum(np.abs(np.asarray([x, y]) - np.asarray(coins)), axis = 1))
-    reward = 0
-    #calculate a reward to give for a given action
+    reward = -1
+
+    #calculate a reward for a given action
     if e.COIN_COLLECTED in events:
-        reward += 1500
-    else:
-        reward += min(145,150*(old_dist - self.coindist))
+        reward += 1000
     if e.KILLED_SELF in events:
-        reward -= 200
+        reward -= 20000
     if e.WAITED in events:
-        reward -= 1000
+        reward -= 10
     if e.INVALID_ACTION in events:
         reward -= 1000
+    if self.coindist < old_dist:
+        reward += 100
+    if self.coindist > old_dist:
+        reward -= 10
     self.score += reward
     return reward
 
 def create_train_batch(self, i):
     train_batch = {'old_states': [], 'new_states': [], 'oldQ': [], 'actions': [], 'rewards': []}
     train_batch['old_states'] = self.data['old_states'][i]
-    train_batch['new_states'] = self.data['new_states'][i+self.n_step]
+    train_batch['new_states'] = self.data['new_states'][i+self.n_step-1]
     train_batch['oldQ'] = self.data['oldQ'][i]
     train_batch['actions'] = self.data['actions'][i]
-    train_batch['rewards'] = self.data['rewards'][i:self.n_step+i]
+    train_batch['rewards'] = self.data['rewards'][i:(self.n_step-1+i)]
     return train_batch
 
 def create_training_data(self, reward, old_state):
@@ -169,17 +183,16 @@ def setup(self):
     """
     self.logger.debug('Successfully entered setup code')
     np.random.seed()
-    self.n_step = 5
+    self.n_step = 7
     self.model = Model(self.logger)
-    #self.model.load_model('/home/russell/bomberman_ai/agent_code/nn_agent/weights.sav')
     self.data = {'old_states': [], 'new_states': [], 'oldQ': [], 'actions': [], 'rewards': []}
     self.score = 0
     self.rand_count = 0
     self.coindist = 0
     self.rand_round = 0
     self.train_set =[]
-
-
+    self.state = np.zeros(6)
+    self.epsilon = 0.1
 
 def act(self):
     """Called each game step to determine the agent's next action.
@@ -194,15 +207,13 @@ def act(self):
     in settings.py, execution is interrupted by the game and the current value
     of self.next_action will be used. The default value is 'WAIT'.
     """
-    # Gather information about the game state
-    #prepare the data given to the model to estimate here
     actions = ['LEFT', 'RIGHT', 'UP', 'DOWN', 'WAIT', 'BOMB']
     create_state(self)
 
     action_code, self.scores = self.model.estimate(self.state)
     self.logger.debug(f"choosing action {action_code[0]} with scores {self.scores[0]}")
     self.next_action = actions[action_code[0]]
-    choose_rand_action(self, 0.05, 1)
+    choose_rand_action(self, 1)
     self.last_action = self.next_action
 
 def reward_update(self):
@@ -214,13 +225,13 @@ def reward_update(self):
     agent based on these events and your knowledge of the (new) game state. In
     contrast to act, this method has no time limit.
     """
+    self.logger.debug(f"Game state step: {self.game_state['step']}")
     if self.game_state["step"] == 1:
         return
     old_state = self.state
     create_state(self)
     reward = calculate_reward(self)
     create_training_data(self, reward, old_state)
-
 
 def end_of_episode(self):
     """Called at the end of each game to hand out final rewards and do training.
@@ -238,12 +249,16 @@ def end_of_episode(self):
     self.logger.debug(f"Reward in episode: {self.score}")
     self.score = 0
 
-    for i in range(len(self.data['old_states']) - self.n_step):
+    for i in range(len(self.data['old_states']) - (self.n_step-1)):
         self.train_set.append(create_train_batch(self, i))
 
-    self.model.fit(np.random.choice(self.train_set, size=(math.ceil(self.game_state['step']/2)), replace=False))
+    self.model.fit(self.train_set)
+
+    self.logger.debug(f'Printing training batch:')
+    self.logger.debug(f'chosen action: {self.data["actions"][4]}')
+    self.logger.debug(f'rewards of n following steps: {self.data["rewards"][-4:]}')
 
     self.data = {'old_states': [], 'new_states': [], 'oldQ': [], 'actions': [], 'rewards': []}
-    self.model.save_model('/home/russell/bomberman_ai/agent_code/nn_agent/weights.sav')
+    self.model.save_model('weights.h5')
     self.rand_round -= 1
     self.rand_count = 0
